@@ -5,7 +5,8 @@ import time
 import re
 from concurrent.futures import ThreadPoolExecutor
 import os
-import pickle
+import pymongo
+from pymongo import MongoClient
 from datetime import datetime, timedelta
 import google.generativeai as genai
 import asyncio
@@ -13,8 +14,16 @@ from typing import Optional
 
 app = Flask(__name__)
 
+# MongoDB setup
+MONGODB_URI = "mongodb+srv://aminekerkarr:S6AzL3AE1buIhBIq@cluster0.u9ckn.mongodb.net/?retryWrites=true&w=majority"
+client = MongoClient(MONGODB_URI)
+db = client['facebook_bot']
+users_collection = db['users']
+messages_collection = db['messages']
+conversations_collection = db['conversations']  # مجموعة جديدة لتخزين المحادثات
+
 # توكن الوصول والرابط من facebook.py
-FACEBOOK_PAGE_ACCESS_TOKEN = 'EAAoLY619jZAMBO4YUFGXGmfCMSsmZBfgjZBkNStozN5eSyBT1UZCJhinAPASssGQlHuUjCaV7nAThnhOCjxVGcxoh1aa67zMjupx2ThFcXYQpuvxVagOB5o6atJvdf6FLtghzJUflL2JjPjkqus4vqbZB1MipOZCpVmM3yyetQUFjKNbIl6KZBStdovZB2xemvVHswZDZD'
+FACEBOOK_PAGE_ACCESS_TOKEN = 'EACCjIphW1zIBO1ZB0m5TTX1EJltFUA33zWar41vlcXNzrr39BTeZCTXH7CtZBejMH0gmVOLia9QXWvOqXhQrR4mhZBsbZCnXNxrbzoJSUeyK65rlxZAZBx4lYw3sguFsYqljZCUsZBSLeZCZAwlwWh2OZA2prpqGMNCnf6atNJsh6CxIpCangi9oLc9iILkeP4I4WZBoCmgZDZD'
 FACEBOOK_GRAPH_API_URL = 'https://graph.facebook.com/v11.0/me/messages'
 MAX_MESSAGE_LENGTH = 2000
 
@@ -25,17 +34,56 @@ user_context = {}
 processed_message_ids = set()
 BOT_START_TIME = None  # وقت بدء تشغيل البوت
 
-# ملفات حفظ البيانات
-PROCESSED_IDS_FILE = 'processed_message_ids.pkl'
-TOTAL_USERS_FILE = 'total_users.pkl'
+# تحميل البيانات المحفوظة
+def load_saved_data():
+    global total_users, processed_message_ids
+    
+    # Load users from MongoDB
+    users_cursor = users_collection.find({})
+    total_users = {str(doc['user_id']): doc['data'] for doc in users_cursor}
+    
+    # Load processed messages from MongoDB
+    messages_cursor = messages_collection.find({})
+    processed_message_ids = set(doc['message_id'] for doc in messages_cursor)
 
-# الحد الأقصى للرسائل القديمة لاستردادها عند التشغيل
-MAX_HISTORY_MESSAGES = 5
-# فترة زمنية لاسترداد الرسائل القديمة (بالساعات)
-HISTORY_TIME_WINDOW = 24  # ساعة 
+# حفظ البيانات
+def save_data():
+    try:
+        # Save users to MongoDB
+        for user_id, user_data in total_users.items():
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'data': user_data}},
+                upsert=True
+            )
+        
+        # Save processed messages to MongoDB
+        for message_id in processed_message_ids:
+            messages_collection.update_one(
+                {'message_id': message_id},
+                {'$set': {'processed': True}},
+                upsert=True
+            )
+            
+    except Exception as e:
+        print(f"Error saving data to MongoDB: {str(e)}")
 
 # إضافة استيراد مكتبة Gemini
 import google.generativeai as genai
+
+GEMINI_APIS = [
+    'AIzaSyC8swpbv_LJPo5V3HpF5j94QsAfI633mIs',
+    'AIzaSyDYn2XJC5-lo7xHvJ2bLyBlwdW_kF_7Mso',
+    'AIzaSyCmQxBZrSjx284cGBMoMo9DPkidbyjAvsA',
+    'AIzaSyA2vgP-8GZYI93tQcDWDu-NJEX0OvNbK8g'
+]
+current_api_index = 0
+
+def get_next_api_key():
+    global current_api_index
+    api_key = GEMINI_APIS[current_api_index]
+    current_api_index = (current_api_index + 1) % len(GEMINI_APIS)
+    return api_key
 
 class AIHandler:
     def __init__(self, api_key: str):
@@ -49,7 +97,7 @@ class AIHandler:
         self.base_context = """
         تعليمات المساعد الذكي باللهجة الجزائرية:
 
-        1. عند السؤال فقط عن المطور/المبرمج:
+        1. عند السؤال عن المطور/المبرمج:
            - "طورني أمين من الجزائر 🇩🇿"
            - "تقدر تتواصل معاه على الانستا: amine.kr7"
            - لا تذكر أي معلومات تقنية أو نماذج مستخدمة.
@@ -205,151 +253,25 @@ class AIHandler:
         return None
 
     async def get_response(self, user_message: str) -> Optional[str]:
-        while self.retry_count < self.max_retries:
+        for _ in range(len(GEMINI_APIS)):
             try:
+                genai.configure(api_key=get_next_api_key())
+                model = genai.GenerativeModel('gemini-pro')
                 prompt = f"""
                 {self.base_context}
                 رسالة المستخدم: {user_message}
                 قم بالرد باللهجة الجزائرية مع مراعاة التعليمات أعلاه.
                 """
-                
-                response = await asyncio.to_thread(
-                    self.model.generate_content,
-                    prompt
-                )
-                self.retry_count = 0
+                response = await model.generate_content_async(prompt)
                 return response.text
-                
             except Exception as e:
-                self.retry_count += 1
-                if self.retry_count < self.max_retries:
-                    await asyncio.sleep(self.retry_delay * self.retry_count)
-                    continue
-                print(f"Error in get_response after {self.max_retries} retries: {str(e)}")
-                return None
-        
-        self.retry_count = 0
+                print(f'Error with API key: {str(e)}. Trying next API key...')
+                continue
+        print('All API keys exhausted. Please try again later.')
         return None
 
 # تهيئة Gemini API
-GEMINI_API = os.getenv("GEMINI_API", "AIzaSyC8swpbv_LJPo5V3HpF5j94QsAfI633mIs")
-ai_handler = AIHandler(GEMINI_API)
-
-# تحميل البيانات المحفوظة
-def load_saved_data():
-    """
-    تحميل البيانات المحفوظة من الملفات
-    """
-    global processed_message_ids, user_context, total_users
-    
-    try:
-        if os.path.exists(PROCESSED_IDS_FILE):
-            with open(PROCESSED_IDS_FILE, 'rb') as f:
-                processed_message_ids = pickle.load(f)
-            print(f"تم تحميل {len(processed_message_ids)} معرف رسالة")
-            
-        if os.path.exists(TOTAL_USERS_FILE):
-            with open(TOTAL_USERS_FILE, 'rb') as f:
-                total_users = pickle.load(f)
-                if isinstance(total_users, set):  # تحويل من set الى dictionary إذا كان قديماً
-                    new_total_users = {}
-                    for user_id in total_users:
-                        new_total_users[user_id] = {
-                            'message_count': 0,
-                            'first_interaction': datetime.now(),
-                            'last_interaction': datetime.now()
-                        }
-                    total_users = new_total_users
-            print(f"تم تحميل معلومات {len(total_users)} مستخدم")
-            
-    except Exception as e:
-        print(f"خطأ في تحميل البيانات: {e}")
-        # تهيئة القيم الافتراضية في حالة الخطأ
-        processed_message_ids = set()
-        total_users = {}
-
-# حفظ البيانات دوريًا
-def save_data():
-    try:
-        with open(PROCESSED_IDS_FILE, 'wb') as f:
-            pickle.dump(processed_message_ids, f)
-        with open(TOTAL_USERS_FILE, 'wb') as f:
-            pickle.dump(total_users, f)
-        
-        print(f"تم حفظ البيانات: {len(processed_message_ids)} رسالة، {len(total_users)} مستخدم")
-    except Exception as e:
-        print(f"خطأ في حفظ البيانات: {e}")
-
-def validate_message(message_text):
-    """
-    التحقق من صحة الرسالة قبل إرسالها
-    """
-    if not message_text or not isinstance(message_text, str):
-        return False
-    
-    # التحقق من الرسائل المكررة مثل "هههههههه"
-    if re.match(r'^(.)\1{10,}$', message_text):
-        return False
-    
-    # التحقق من الأحرف المنقطعة أو غير المفهومة
-    if len(message_text.strip()) < 3:
-        return False
-    
-    # التحقق من وجود نص عربي حقيقي في الرسالة
-    arabic_text_pattern = re.compile(r'[\u0600-\u06FF\s]{3,}')
-    if not arabic_text_pattern.search(message_text):
-        return False
-    
-    return True
-
-def send_facebook_message(recipient_id, message_text, quick_replies=None):
-    """
-    إرسال رسالة إلى مستخدم فيسبوك مع التحقق من صحتها أولاً
-    """
-    if not validate_message(message_text):
-        if recipient_id != admin:
-            notify_admin_of_error(recipient_id, "رسالة غير صالحة", 
-                                f"حاول البوت إرسال: {message_text[:100]}...")
-            message_text = "سمحلي خويا/ختي، كاين مشكل تقني، راني نحاول نصلحه 🙏"
-    
-    url = FACEBOOK_GRAPH_API_URL
-    params = {
-        "access_token": FACEBOOK_PAGE_ACCESS_TOKEN
-    }
-    headers = {
-        "Content-Type": "application/json"
-    }
-    
-    # التحقق من طول الرسالة
-    if len(message_text) > MAX_MESSAGE_LENGTH:
-        message_text = message_text[:MAX_MESSAGE_LENGTH-100] + "..."
-    
-    data = {
-        "recipient": {
-            "id": str(recipient_id)  # تحويل المعرف إلى نص
-        },
-        "message": {
-            "text": message_text
-        }
-    }
-    
-    if quick_replies:
-        data["message"]["quick_replies"] = quick_replies
-
-    try:
-        response = requests.post(url, params=params, headers=headers, json=data)  # استخدام json بدل data
-        response.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as err:
-        print(f"Error sending message: {err}")
-        if recipient_id == admin:
-            print(f"Failed to send message to admin. Error: {err}")
-        return False
-
-def notify_admin_of_error(user_id, error_type, error_details):
-    """إرسال إشعار الخطأ إلى المسؤول"""
-    message = f"🚨 كاين مشكل في البوت:\nUser: {user_id}\nنوع المشكل: {error_type}\nتفاصيل: {error_details}"
-    send_facebook_message(admin, message)
+ai_handler = AIHandler(get_next_api_key())
 
 # إضافة متغيرات للتحكم في معدل الرسائل
 user_message_timestamps = {}  # تخزين توقيت آخر رسالة لكل مستخدم
@@ -418,62 +340,137 @@ def check_rate_limit(sender_id: str) -> tuple[bool, bool]:
     user_message_timestamps[sender_id] = current_time
     return True, False
 
-def handle_facebook_message(sender_id, message_text, message_id, created_time=None, is_historical=False, image_data=None):
+def validate_message(message_text):
     """
-    معالجة رسالة فيسبوك واردة
+    التحقق من صحة الرسالة قبل إرسالها
     """
+    if not message_text or not isinstance(message_text, str):
+        return False
+    
+    # التحقق من الرسائل المكررة مثل "هههههههه"
+    if re.match(r'^(.)\1{10,}$', message_text):
+        return False
+    
+    # التحقق من الأحرف المنقطعة أو غير المفهومة
+    if len(message_text.strip()) < 3:
+        return False
+    
+    # التحقق من وجود نص عربي حقيقي في الرسالة
+    arabic_text_pattern = re.compile(r'[\u0600-\u06FF\s]{3,}')
+    if not arabic_text_pattern.search(message_text):
+        return False
+    
+    return True
+
+async def handle_facebook_message(sender_id, message_text, message_id, created_time=None, is_historical=False, image_data=None):
+    """معالجة رسالة فيسبوك واردة"""
     if message_id in processed_message_ids:
         return
-    
-    processed_message_ids.add(message_id)
-    
-    # التحقق من معدل الرسائل
-    can_proceed, just_blocked = check_rate_limit(sender_id)
-    if not can_proceed:
-        if just_blocked:
-            # إرسال رسالة للمستخدم عند حظره
-            block_message = f"عذراً، تم حظرك مؤقتاً لمدة {BLOCK_DURATION//60} دقائق بسبب إرسال الكثير من الرسائل في وقت قصير 🚫\nالرجاء المحاولة لاحقاً."
-            send_facebook_message(sender_id, block_message)
-        return
-
-    # تحديث إحصائيات المستخدم
-    if sender_id not in total_users:
-        total_users[sender_id] = {
-            'message_count': 0,
-            'first_interaction': datetime.now(),
-            'last_interaction': datetime.now()
-        }
-    
-    total_users[sender_id]['message_count'] += 1
-    total_users[sender_id]['last_interaction'] = datetime.now()
-    
-    # إنشاء سياق جديد إذا لم يكن موجوداً
-    if sender_id not in user_context:
-        user_context[sender_id] = []
 
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # حفظ رسالة المستخدم أولاً
+        current_time = datetime.now()
+        message_data = {
+            'message_id': message_id,
+            'sender_id': sender_id,
+            'user_message': message_text,
+            'timestamp': created_time or current_time,
+            'processed': True
+        }
         
-        if image_data:
-            print(f"معالجة صورة من المستخدم {sender_id}")
-            response = loop.run_until_complete(ai_handler.analyze_image(image_data))
-        else:
-            print(f"معالجة رسالة نصية من المستخدم {sender_id}")
-            response = loop.run_until_complete(ai_handler.get_response(message_text))
+        # حفظ في MongoDB
+        messages_collection.insert_one(message_data)
+        processed_message_ids.add(message_id)
+        
+        # معالجة الرسالة والحصول على رد البوت
+        try:
+            if image_data:
+                response = await ai_handler.analyze_image(image_data)
+            else:
+                response = await ai_handler.get_response(message_text)
             
-        loop.close()
-        
-        # فقط إرسال الرد إذا كان صالحاً
-        if response and validate_message(response):
-            success = send_facebook_message(sender_id, response)
-            if not success:
-                print(f"فشل في إرسال الرسالة للمستخدم {sender_id}")
-        
-        save_data()
-        
+            if response and validate_message(response):
+                # تحديث الوثيقة بإضافة رد البوت
+                messages_collection.update_one(
+                    {'message_id': message_id},
+                    {
+                        '$set': {
+                            'bot_reply': response,
+                            'bot_reply_timestamp': datetime.now()
+                        }
+                    }
+                )
+                
+                # إرسال الرد للمستخدم
+                send_facebook_message(sender_id, response)
+                
+        except Exception as e:
+            print(f"خطأ في معالجة الرسالة: {str(e)}")
+            messages_collection.update_one(
+                {'message_id': message_id},
+                {
+                    '$set': {
+                        'error': str(e),
+                        'error_timestamp': datetime.now()
+                    }
+                }
+            )
+            
     except Exception as e:
-        print(f"خطأ في معالجة الرسالة: {str(e)}")
+        print(f"خطأ في حفظ الرسالة: {str(e)}")
+
+def send_facebook_message(recipient_id, message_text, message_id=None, quick_replies=None):
+    """
+    إرسال رسالة إلى مستخدم فيسبوك مع التحقق من صحتها أولاً
+    """
+    if not validate_message(message_text):
+        if recipient_id != admin:
+            notify_admin_of_error(recipient_id, "رسالة غير صالحة", 
+                                f"حاول البوت إرسال: {message_text[:100]}...")
+            message_text = "سمحلي خويا/ختي، كاين مشكل تقني، راني نحاول نصلحه 🙏"
+    
+    url = FACEBOOK_GRAPH_API_URL
+    params = {
+        "access_token": FACEBOOK_PAGE_ACCESS_TOKEN
+    }
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    if len(message_text) > MAX_MESSAGE_LENGTH:
+        message_text = message_text[:MAX_MESSAGE_LENGTH-100] + "..."
+    
+    data = {
+        "recipient": {
+            "id": str(recipient_id)
+        },
+        "message": {
+            "text": message_text
+        }
+    }
+    
+    if quick_replies:
+        data["message"]["quick_replies"] = quick_replies
+
+    try:
+        response = requests.post(url, params=params, headers=headers, json=data)
+        response.raise_for_status()
+        
+        # تحديث رد البوت في قاعدة البيانات إذا كان هناك message_id
+        if message_id:
+            update_bot_reply(message_id, message_text)
+        
+        return True
+    except requests.exceptions.RequestException as err:
+        print(f"Error sending message: {err}")
+        if recipient_id == admin:
+            print(f"Failed to send message to admin. Error: {err}")
+        return False
+
+def notify_admin_of_error(user_id, error_type, error_details):
+    """إرسال إشعار الخطأ إلى المسؤول"""
+    message = f"🚨 كاين مشكل في البوت:\nUser: {user_id}\nنوع المشكل: {error_type}\nتفاصيل: {error_details}"
+    send_facebook_message(admin, message)
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
@@ -516,12 +513,12 @@ def webhook():
                                         image_data = image_response.content
                                         message_id = messaging_event['message'].get('mid')
                                         print(f"تم استلام صورة من المستخدم {sender_id}")
-                                        handle_facebook_message(
+                                        asyncio.run(handle_facebook_message(
                                             sender_id=sender_id,
                                             message_text="",
                                             message_id=message_id,
                                             image_data=image_data
-                                        )
+                                        ))
                                 except Exception as e:
                                     print(f"خطأ في تحميل الصورة: {str(e)}")
                                     continue
@@ -531,11 +528,11 @@ def webhook():
                         message_text = messaging_event['message']['text']
                         message_id = messaging_event['message']['mid']
                         print(f"تم استلام رسالة نصية من المستخدم {sender_id}: {message_text}")
-                        handle_facebook_message(
+                        asyncio.run(handle_facebook_message(
                             sender_id=sender_id,
                             message_text=message_text,
                             message_id=message_id
-                        )
+                        ))
     except Exception as e:
         print(f"خطأ في معالجة webhook: {str(e)}")
     
@@ -580,12 +577,12 @@ def poll_facebook_messages():
                     
                     if sender_id and message_text and sender_id != 'PAGE_ID':
                         print(f"رسالة جديدة من {sender_id} 📨: {message_text}")
-                        handle_facebook_message(
+                        asyncio.run(handle_facebook_message(
                             sender_id,
                             message_text,
                             message_id,
                             created_time
-                        )
+                        ))
             
             consecutive_errors = 0
 
@@ -609,7 +606,7 @@ def get_limited_history():
     استرجاع عدد محدود من الرسائل التاريخية باستخدام نافذة زمنية محددة
     """
     try:
-        time_window = int(time.time()) - (HISTORY_TIME_WINDOW * 3600)  # تحويل الساعات إلى ثوانٍ
+        time_window = int(time.time()) - (24 * 3600)  # تحويل الساعات إلى ثوانٍ
         url = f"https://graph.facebook.com/v11.0/me/conversations?fields=messages.limit(50){{message,from,id,created_time}}&access_token={FACEBOOK_PAGE_ACCESS_TOKEN}"
         response = requests.get(url)
         response.raise_for_status()
@@ -664,15 +661,20 @@ def get_limited_history():
             
             # أخذ الحد الأقصى فقط من الرسائل لكل مستخدم
             for idx, msg in enumerate(sorted_messages):
-                if idx < MAX_HISTORY_MESSAGES:
+                if idx < 5:
                     print(f"استرداد رسالة تاريخية من {sender_id}: {msg['message_text']}")
-                    handle_facebook_message(
-                        sender_id,
-                        msg['message_text'],
-                        msg['message_id'],
-                        msg['created_time'],
-                        is_historical=True
-                    )
+                    messages = messages_collection.find(
+                        {'sender_id': sender_id},
+                        {'message_id': 1, 'sender_id': 1, 'user_message': 1, 'bot_reply': 1, 'timestamp': 1}
+                    ).sort('timestamp', -1).limit(5)
+                    for message in messages:
+                        asyncio.run(handle_facebook_message(
+                            sender_id,
+                            message['user_message'],
+                            message['message_id'],
+                            message['timestamp'],
+                            is_historical=True
+                        ))
                     historical_message_count += 1
                 else:
                     break
