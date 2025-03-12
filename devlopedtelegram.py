@@ -20,7 +20,7 @@ import json
 
 # تهيئة المتغيرات الأساسية
 GEMINI_API = "AIzaSyCmQxBZrSjx284cGBMoMo9DPkidbyjAvsA"
-TELEGRAM_TOKEN = "7559684997:AAH3UEAPDNQzw05RosY-luqf4BdwPsWbBXw"
+TELEGRAM_TOKEN = "7916506267:AAFOxy5ITv7byHsXSr05vK5B3ghLvsSrgWc"
 MONGO_URL = "mongodb+srv://aminekerkarr:S6AzL3AE1buIhBIq@cluster0.u9ckn.mongodb.net/?retryWrites=true&w=majority"
 
 # تهيئة Gemini API
